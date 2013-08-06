@@ -35,11 +35,33 @@ module Spin
 
       open_socket do |socket|
         preload(options) if root_path
+        self_read, self_write = IO.pipe
 
-        logger.info "Pushing test results back to push processes" if options[:push_results]
+        if options[:push_results]
+          logger.info "Pushing test results back to push processes"
+        else
+          # Trap SIGQUIT (Ctrl+\) and re-run the last files that were pushed
+          trap('QUIT') { self_write.puts('QUIT') }
+        end
+        # Trap SIGINT (Ctrl+C) and only quit when double-pressed
+        trap('SIGINT'){ self_write.puts('SIGINT') }
 
         loop do
-          run_pushed_tests(socket, options)
+          notify_ready
+
+          readable_io = IO.select([socket, self_read])[0][0]
+          if readable_io == self_read
+            # One of our signal handlers has fired
+            case readable_io.gets.strip
+            when 'QUIT'
+              sigquit_handler(options)
+            when 'SIGINT'
+              sigint_handler(socket)
+            end
+          else
+            # The socket must have had a new test written to it
+            run_pushed_tests(socket, options)
+          end
         end
       end
     end
@@ -136,10 +158,6 @@ module Spin
     end
 
     def run_pushed_tests(socket, options)
-      rerun_last_tests_on_quit(options) unless options[:push_results]
-
-      notify_ready
-
       # Since `spin push` reconnects each time it has new files for us we just
       # need to accept(2) connections from it.
       conn = socket.accept
@@ -172,12 +190,6 @@ module Spin
       end
     end
 
-    # Trap SIGQUIT (Ctrl+\) and re-run the last files that were pushed
-    # TODO test this
-    def rerun_last_tests_on_quit(options)
-      trap('QUIT') { sigquit_handler(options) }
-    end
-
     # This method is called when a SIGQUIT ought to be handled.
     def sigquit_handler(options)
       # If the current process is not the Spin server process, ignore the
@@ -195,8 +207,6 @@ module Spin
       end
 
       fork_and_run(@last_files_ran, nil, options.merge(:trailing_args => @last_trailing_args_used))
-
-      notify_ready
     end
 
     # Notify the user that Spin server is ready for new tests.
@@ -251,8 +261,6 @@ module Spin
       file = socket_file
       File.delete(file) if File.exist?(file)
       socket = UNIXServer.open(file)
-
-      trap('SIGINT') { sigint_handler(socket) }
 
       yield socket
     ensure
